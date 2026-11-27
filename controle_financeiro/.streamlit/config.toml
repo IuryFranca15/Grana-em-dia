@@ -1,0 +1,21 @@
+# Tema "Ultravioleta": índigo/violeta com destaque coral
+[server]
+# o app guarda dados financeiros: acessível só neste computador
+address = "localhost"
+
+[theme]
+base = "light"
+primaryColor = "#5B3FD6"
+backgroundColor = "#F7F6FC"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1E1A33"
+borderColor = "#DDD8F0"
+showWidgetBorder = true
+baseRadius = "0.75rem"
+
+[theme.sidebar]
+backgroundColor = "#1E1746"
+secondaryBackgroundColor = "#2D2463"
+textColor = "#F1EEFF"
+primaryColor = "#FF8A5B"
+borderColor = "#43398A"

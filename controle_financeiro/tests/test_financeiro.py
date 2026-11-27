@@ -1,14 +1,19 @@
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
+
 # isola o banco de teste ANTES de importar financeiro
-os.environ.setdefault("FINANCEIRO_DB", os.path.join(tempfile.gettempdir(), "radar_testes.db"))
+# atribuição forçada: os testes apagam tabelas e nunca podem tocar no banco real
+os.environ["FINANCEIRO_DB"] = os.path.join(tempfile.mkdtemp(), "radar_testes.db")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import financeiro  # noqa: E402
 from financeiro import (  # noqa: E402
     CATEGORIES, category_variation, db_connection, detect_recurrences,
     forecast_month, guess_category, learn_from_correction, outliers,
@@ -238,6 +243,113 @@ class RadarTests(unittest.TestCase):
         
         self.assertFalse(out.empty)
         self.assertEqual(out.iloc[0]["amount"], 1000.0) # O maior deve ser o outlier
+
+
+class RegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.path = Path(tempfile.mkdtemp()) / "banco.db"
+
+    def connect(self):
+        conn = financeiro.db_connection(self.path)
+        self.addCleanup(conn.close)
+        return conn
+
+    def test_old_database_is_migrated_with_backup(self):
+        old = sqlite3.connect(self.path)
+        old.executescript("""
+            CREATE TABLE transactions (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint TEXT UNIQUE, transaction_date TEXT, description TEXT,
+                amount REAL NOT NULL, category TEXT NOT NULL DEFAULT 'Outros',
+                source_file TEXT, card TEXT DEFAULT '', created_at TEXT);
+            CREATE TABLE category_rules (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                keyword TEXT UNIQUE, category TEXT NOT NULL);
+            INSERT INTO category_rules (keyword, category) VALUES ('PRECO REAL', 'Alimentação');
+        """)
+        old.execute("INSERT INTO transactions (fingerprint, transaction_date, description, amount) "
+                    "VALUES (?, '2026-10-01', 'UBER', 10.0)",
+                    (financeiro.fingerprint("2026-10-01", "UBER", 10.0),))
+        old.commit()
+        old.close()
+        conn = self.connect()
+        self.assertEqual(guess_category("Preco Real", conn)[0], "Alimentação")
+        row = {"Data": "2026-10-01", "Descrição": "UBER", "Valor": 10.0}
+        self.assertEqual(save_transactions(conn, [row], "x", ""), (0, 1, 0))
+        self.assertEqual(len(list(self.path.parent.glob("banco.backup-*.db"))), 1)
+
+    def test_categories_are_not_duplicated(self):
+        first = self.connect().execute("SELECT COUNT(*) FROM categories").fetchone()[0]
+        second = self.connect().execute("SELECT COUNT(*) FROM categories").fetchone()[0]
+        self.assertEqual(first, second)
+
+    def test_identical_purchases_are_kept_but_reimport_is_ignored(self):
+        conn = self.connect()
+        rows, diagnostics = parse_invoice_text("03/10 UBER R$ 10,00\n03/10 UBER R$ 10,00")
+        self.assertEqual(diagnostics["repeated"], 1)
+        self.assertEqual(save_transactions(conn, rows, "x", ""), (2, 0, 0))
+        self.assertEqual(save_transactions(conn, rows, "x", ""), (0, 2, 0))
+
+    def test_learned_rule_matches_its_own_description(self):
+        conn = self.connect()
+        learn_from_correction(conn, "Mariana da Nobrega Ma", "Saúde", None)
+        self.assertEqual(guess_category("Mariana da Nobrega Ma", conn)[0], "Saúde")
+
+    def test_short_terms_need_whole_word(self):
+        self.assertEqual(guess_category("PRAIA BAR")[0], "Outros")
+        self.assertEqual(guess_category("DROGA RAIA")[0], "Farmácia")
+
+    def test_correction_in_preview_is_learned(self):
+        conn = self.connect()
+        save_transactions(conn, [{"Data": "2026-10-01", "Descrição": "Preco Real", "Valor": 5.0,
+                                  "Categoria": "Alimentação", "Subcategoria": "Mercado"}], "x", "")
+        self.assertEqual(guess_category("Preco Real", conn), ("Alimentação", "Mercado"))
+
+    def test_blank_editor_row_is_invalid(self):
+        conn = self.connect()
+        blank = {"Data": None, "Descrição": None, "Valor": float("nan")}
+        self.assertEqual(save_transactions(conn, [blank], "x", ""), (0, 0, 1))
+
+    def test_table_import_reads_iso_dates_and_rejects_empty_amount(self):
+        frame = pd.DataFrame({"d": ["2026-10-03", "04/10/2026", "2026-10-05"],
+                              "t": ["A", "B", "C"], "v": ["1,00", "2,00", float("nan")]})
+        rows, _ = financeiro.normalize_table_rows(frame, "d", "t", "v")
+        self.assertEqual([r["Data"] for r in rows], ["2026-10-03", "2026-10-04"])
+
+    def test_frequent_rides_are_not_recurrences(self):
+        conn = self.connect()
+        save_transactions(conn, [{"Data": f"2026-10-{d:02d}", "Descrição": "UBER", "Valor": 12.0}
+                                 for d in (1, 2, 3, 15, 17)], "x", "")
+        self.assertTrue(detect_recurrences(conn).empty)
+
+    def test_installments_and_forecast(self):
+        conn = self.connect()
+        save_transactions(conn, [{"Data": "2026-05-01", "Descrição": "LOJA PARC 06/08",
+                                  "Valor": 50.0}], "x", "")
+        future = financeiro.installment_commitments(conn)
+        self.assertEqual(future["month"].tolist(), ["2026-11", "2026-12"])
+        forecast = forecast_month(conn, today=date(2026, 11, 20))
+        self.assertEqual(forecast["installment_estimate"], 50.0)
+        self.assertFalse(forecast["has_current"])
+
+    def test_budget_applies_to_simulation(self):
+        conn = self.connect()
+        financeiro.set_budget(conn, date.today().strftime("%Y-%m"), 100, "Lazer")
+        simulation = simulate_purchase(conn, 300, "Lazer", installments=2)
+        self.assertEqual(simulation["delta"], 150)
+        self.assertTrue(simulation["over_category"])
+
+    def test_manual_entries_may_repeat(self):
+        conn = self.connect()
+        for _ in range(2):
+            self.assertTrue(financeiro.add_manual_transaction(conn, date.today(), "Pão", 5))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0], 2)
+
+    def test_readonly_connection_leaves_file_untouched(self):
+        self.connect().close()
+        before = self.path.read_bytes()
+        conn = financeiro.readonly_connection(self.path)
+        detect_recurrences(conn)
+        conn.close()
+        self.assertEqual(before, self.path.read_bytes())
 
 
 if __name__ == "__main__":
