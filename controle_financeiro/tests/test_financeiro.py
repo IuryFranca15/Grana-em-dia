@@ -1,9 +1,22 @@
+import os
+import sys
+import tempfile
 import unittest
+from datetime import date
+from pathlib import Path
 
-from financeiro import guess_category, parse_invoice_text
+# isola o banco de teste ANTES de importar financeiro
+os.environ.setdefault("FINANCEIRO_DB", os.path.join(tempfile.gettempdir(), "radar_testes.db"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from financeiro import (  # noqa: E402
+    CATEGORIES, category_variation, db_connection, detect_recurrences,
+    forecast_month, guess_category, learn_from_correction, outliers,
+    parse_invoice_text, pending_review, save_transactions, simulate_purchase,
+)
 
 
-class FinanceiroParserTests(unittest.TestCase):
+class ParserTests(unittest.TestCase):
     def test_categories_from_sample_invoice(self):
         expected = {
             "IFD*55454286 FRANCISCO": "Alimentação",
@@ -27,7 +40,7 @@ class FinanceiroParserTests(unittest.TestCase):
         }
         for description, category in expected.items():
             with self.subTest(description=description):
-                self.assertEqual(guess_category(description), category)
+                self.assertEqual(guess_category(description)[0], category)
 
     def test_payment_is_ignored_and_purchases_are_parsed(self):
         text = """\
@@ -47,7 +60,8 @@ class FinanceiroParserTests(unittest.TestCase):
         rows, _ = parse_invoice_text(text)
         self.assertEqual(len(rows), 2)
         self.assertEqual([row["Valor"] for row in rows], [46.38, 27.00])
-        self.assertEqual([row["Descrição"] for row in rows], ["IFD*55454286 FRANCISCO", "TOCAPUB"])
+        self.assertEqual([row["Descrição"] for row in rows],
+                         ["IFD*55454286 FRANCISCO", "TOCAPUB"])
 
 
 NUBANK_SAMPLE = """\
@@ -108,7 +122,6 @@ class NubankParserTests(unittest.TestCase):
         self.assertEqual([r["Data"] for r in rows], ["2026-12-20", "2027-01-05"])
 
     def test_nubank_amount_on_separate_line(self):
-        # Layout em que o valor vem depois das notas do lançamento.
         text = """\
 FATURA 22 OUT 2026 EMISSÃO E ENVIO 15 OUT 2026
 Total a pagar R$ 684,23
@@ -130,17 +143,101 @@ R$ 3,00
         rows, _ = parse_invoice_text(text)
         self.assertEqual(
             [(r["Descrição"], r["Valor"]) for r in rows],
-            [("Dl*Uberrides", 13.96), ("Iury Mendonca Freire de Franca", 25.74), ("IOF de atraso", 3.00)],
+            [("Dl*Uberrides", 13.96),
+             ("Iury Mendonca Freire de Franca", 25.74),
+             ("IOF de atraso", 3.00)],
         )
 
     def test_late_fee_categories(self):
         for description in ("IOF de atraso", "Juros de atraso", "Multa de atraso"):
-            self.assertEqual(guess_category(description), "Tarifas e encargos")
+            self.assertEqual(guess_category(description)[0], "Tarifas e encargos")
 
     def test_bb_layout_still_uses_generic_parser(self):
         rows, diagnostics = parse_invoice_text("03/10 DL*99 RIDE SAO PAULO BR R$ 12,70")
         self.assertEqual(len(rows), 1)
         self.assertNotEqual(diagnostics.get("bank"), "Nubank")
+
+
+class RadarTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db_connection()
+        self.conn.execute("DELETE FROM transactions")
+        self.conn.execute("DELETE FROM category_rules")
+        self.conn.execute("DELETE FROM recurrences")
+        self.conn.commit()
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_guess_returns_category_and_subcategory(self):
+        self.assertEqual(guess_category("DL*UberRides", self.conn), ("Transporte", "Aplicativo"))
+        self.assertEqual(guess_category("IFD*IFOOD", self.conn), ("Alimentação", "Restaurante"))
+        self.assertEqual(guess_category("SUPERMERCADO XYZ", self.conn), ("Alimentação", "Mercado"))
+
+    def test_learn_from_correction_creates_rule(self):
+        learn_from_correction(self.conn, "PADARIA CENTRAL LTDA", "Alimentação", "Mercado")
+        cat, sub = guess_category("PADARIA CENTRAL LTDA 2", self.conn)
+        self.assertEqual((cat, sub), ("Alimentação", "Mercado"))
+
+    def test_category_variation(self):
+        save_transactions(self.conn, [
+            {"Data": "2026-09-10", "Descrição": "IFOOD", "Valor": 100.0},
+            {"Data": "2026-10-10", "Descrição": "IFOOD", "Valor": 150.0},
+        ], "teste", "")
+        var = category_variation(self.conn)
+        self.assertGreater(var.loc["Alimentação", "var_pct"], 40)
+
+    def test_detect_recurrences(self):
+        rows = [
+            {"Data": f"2026-0{m}-05", "Descrição": "NETFLIX", "Valor": 39.90}
+            for m in (7, 8, 9, 10)
+        ]
+        save_transactions(self.conn, rows, "teste", "")
+        rec = detect_recurrences(self.conn)
+        self.assertTrue(any("NETFLIX" in m for m in rec["merchant"].tolist()))
+
+    def test_forecast_returns_band(self):
+        save_transactions(self.conn, [
+            {"Data": date.today().replace(day=1).isoformat(),
+             "Descrição": "IFOOD", "Valor": 100.0},
+        ], "teste", "")
+        fc = forecast_month(self.conn)
+        self.assertGreater(fc["projected"], 0)
+        self.assertLessEqual(fc["low"], fc["high"])
+        self.assertIn("assumptions", fc)
+
+    def test_simulate_purchase(self):
+        save_transactions(self.conn, [
+            {"Data": date.today().replace(day=1).isoformat(),
+             "Descrição": "IFOOD", "Valor": 100.0},
+        ], "teste", "")
+        sim = simulate_purchase(self.conn, 50.0)
+        self.assertAlmostEqual(sim["after"], sim["before"] + 50.0, places=2)
+
+    def test_pending_review(self):
+        self.conn.execute(
+            "INSERT INTO transactions (fingerprint, transaction_date, description, amount, category, reviewed) "
+            "VALUES ('x', '2026-10-10', 'DESCONHECIDO', 10.0, 'Outros', 0)")
+        self.conn.commit()
+        review = pending_review(self.conn)
+        self.assertEqual(len(review), 1)
+
+    def test_outliers_needs_min_sample(self):
+        # Adicionamos 4 transações normais e 1 muito acima para garantir o desvio padrão baixo
+        self.conn.execute("DELETE FROM transactions")
+        self.conn.commit()
+        save_transactions(self.conn, [
+            {"Data": "2026-10-01", "Descrição": "IFOOD", "Valor": 10.0},
+            {"Data": "2026-10-02", "Descrição": "IFOOD", "Valor": 12.0},
+            {"Data": "2026-10-03", "Descrição": "IFOOD", "Valor": 11.0},
+            {"Data": "2026-10-04", "Descrição": "IFOOD", "Valor": 10.0},
+            {"Data": "2026-10-05", "Descrição": "IFOOD", "Valor": 1000.0},
+        ], "teste", "")
+        
+        out = outliers(self.conn)
+        
+        self.assertFalse(out.empty)
+        self.assertEqual(out.iloc[0]["amount"], 1000.0) # O maior deve ser o outlier
 
 
 if __name__ == "__main__":
